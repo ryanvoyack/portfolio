@@ -1,0 +1,1459 @@
+---
+title: "Actuarial Pricing & Clustering"
+author: "Ryan Voyack"
+date: "2025-06-11"
+output: html_document
+fontsize: 12pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+
+# In this project, I will demostrate aptitude for
+  - Actuarial Pricing (section A)
+  - Novel mathematical model formulation and verification (section B)
+  - Code development and technical communication (sections A, B)
+
+
+
+```{r, echo = TRUE, warning=FALSE, results = 'hide', message=FALSE}
+## BEFORE WE START, READ IN REQUIRED LIBRARIES:
+require(readxl)
+library(tidyverse)
+require(sf)
+require(tigris)
+require(plotly)
+require(data.table)
+require(purrr)
+require(gganimate)
+library(ggridges)
+library(leaflet)
+library(cowplot)
+library(patchwork)
+library(slickR)
+library(glue)
+library(magick)
+# require(devtools)
+# devtools::install_github("cuhklinlab/SWKM")
+library(SWKM)
+options(scipen = 999)
+```
+
+
+\[\space\]
+
+<hr>
+
+
+# Section A)  Actuarial pricing exercise
+
+## Motivation:
+
+All insurance companies that provide a private passenger auto product find it very helpful to include rating by ZIP Code in their pricing. I want to lay out an example of how this is done. Luckily, we have resources from California's Department of Insurance (DOI) available publicly online. These resources show losses, exposures, claim counts, and other relevant information by ZIP code for each coverage type provided to the insureds of California. I will get more into the definitions of this things soon. 
+
+Here I perform an empirical pricing analysis to determine ZIP Code ("territory") based pricing factors, these factors multiply the price (which is determined through other rating variables), us actuaries call these "factors". The analysis is *empirical* because we are using observed losses to determine the pricing "factor" (rather than having a GLM spit out factors corresponding to the rating variables you fit). Ideally (absent of costs and such), insurance prices would be identical to the expected "loss cost", or "pure premium". Thus, this exercise is empirical because we price the multiplicative insurance multiplier (that we would multiply to the pure premium) using loss costs themselves.
+
+## Background:
+
+Here is some back ground information, to clear up some jargon:
+
+* **Coverage**:  This is a particular offering within the insurance product, it defines a unique type of loss that can be covered in your insurance product. In California, all coverages are optional and can be chosen by the insured to be added to their policy or not, except for "BI" and "PD", which are required for all policies (namely, in NY and CA).
+  + The different coverage in California are
+    - `BI`: (liability) `Bodily Injury` (for those harmed in an accident that aren't the insured)
+    - `PD`: (liability) `Property Damage` (for property/vehicles damaged by the insured in an accident (but not the insured's vehicle))
+    - `COLL`: `Collision` for the vehicle damage suffered by the insured vehicle on the policy
+    - `COMP`: `Comprehensive` non-collision related damage to the insured's vehicle
+    - `MP`: `Medical Payments` for injuries sustained in an accident by the insured himself
+    - `UMPD`: `Uninsured Property Damage` for the vehicle of the insured in accidents where the at-fault driver is an uninsured motorist
+    - `UMBI`: `Uninsured Bodily Injury` for the bodily injury related expenses to the insured in accidents where the at-fault driver is an uninsured motorist
+* **Factor**:  This is a pricing multiplier, relativity, rating factor, pricing factor, etc.
+  + in the empirical sense, it is the relativistic change in expected loss cost for different levels of the factor ("relativity") (in this case, for different ZIP codes)
+* **Loss cost**: This is identical to so-called "pure premium", it is simply $\text{Total Loss} / \text{Exposure Count}$
+* **Exposure**: This is the unit of something that is insured. For example, with a car insurance policy, 1 unit of exposure would be insuring 1 car for 1 policy term.
+* **Credibility**: This is a mathematical process that actuaries use to dampen a factor that may not have enough observed data underlying it toward a value we'd otherwise expect it to have. We do this when there is low data volume to ensure our results aren't based on a sample that is not truly representative of what we are trying to measure.
+  + Basically, we will construct a "credibility factor" from 0-1, it represents what percentage of the initial pricing factor we trust (and will keep), and what percentage we will set to some pre-determined base level (in our case, as we will see in the analyis, the total coverage loss cost)  
+* **Severity**: This is a measure of loss amount per claim, can be computed as $\text{Total Loss}/\text{Claim Count}$
+* **Frequency**: This is a measure of claim count per number of exposures, can be computed as $\text{Claim Count}/\text{Exposure Count}$
+  + Finally, it's useful to note that us actuaries define $\text{Loss cost} = \text{Severity} \times \text{Frequency}$
+
+
+## Objective:
+
+##### Create from these data, which include losses, exposures, claim counts for each coverage, pricing factors based on ZIP code.
+
+
+
+\[\space\]
+
+## Exercise:
+
+We read in data from [here](https://www.insurance.ca.gov/0250-insurers/0800-rate-filings/#:~:text=2008%C2%A0Frequency%C2%A0and%C2%A0Severity%C2%A0Bands%C2%A0Manual%C2%A0Second%C2%A0Edition%C2%A0Data), and consult its corresponding documentation [here](https://www.insurance.ca.gov/0250-insurers/0800-rate-filings/upload/2008-Bands-Manual-Second-Edition-Updated-With-Data-Through-2011.pdf) (found from link shown [here](https://www.insurance.ca.gov/0250-insurers/0800-rate-filings/#:~:text=2008%C2%A0Bands%C2%A0Manual%C2%A0Second%C2%A0Edition%C2%A0(Updated%C2%A0with%C2%A0data%C2%A0through%C2%A02011)) )
+
+
+### Read in data
+
+From the link above, we read in the xlsx file that has our data, each tab that contains our data points for each coverage. Read each in in separately first.
+
+```{r, cache = TRUE}
+## READ IN DATA
+
+path <- "C:/Users/15708/Downloads/2008-Frequency-and-Severity-Bands-Manual-Second-Edition-Data.xlsx"
+sheetnames <- readxl::excel_sheets(path)
+for(i in sheetnames){
+  if(grepl("band", tolower(i))){
+    ## I don't want these
+    next
+  }
+  assign(gsub("-|\\s", "_", i),
+         readxl::read_excel(path,
+                            sheet = i)
+         )
+}
+
+coverages <- c("BI", "PD", "COLL", "COMP", "MP", "UMPD", "UMBI")
+
+```
+
+
+We will begin our pricing exercise by backing constructing credibility factors for Loss Cost, we do this by backing out of the Severity credibility factors they already have in the data to get coefficient of variation measures for each coverage. We use this and the raw data to create our credibility factors for Loss Cost. Then we create loss cost relativities for each ZIP code and each coverage, and then apply the credibility factors to get credibility weighting rating factors.
+
+
+### Get our raw pricing factors
+
+```{r, cache = TRUE}
+## REVERSE ENGINEER CREDIBILITY TO GET COEFFICIENT OF VARIATION AND DEFINE OUR OWN CREDIBILITY (using, now, Loss Cost instead of Frequency and Severity)
+
+## from the documentation, we know the credibility that they used: 
+# alpha = .05
+k = .1
+p = .95
+# giving: 
+# Z = abs(qnorm(p = (1-p)/2)) = 1.96
+Z = 1.96
+(cred_std_freq = round((Z/k)^2))
+
+## implied standard for full credibility for frequency as described in the pdf
+(cred_std_freq = round((Z/k)^2))
+
+
+## test:
+overall_loss_cost = sum(BI_SEVERITY$Losses) / sum(BI_SEVERITY$`Exposure Years`)
+
+BI_SEVERITY %>%
+  mutate(coef_var_2 = (Credibility^2 / `Claim Count`*cred_std_freq)^-1) %>%
+  mutate(loss_cost_credibility = pmin( sqrt(`Claim Count`/(1+coef_var_2)/cred_std_freq) ,1),
+         loss_cost = Losses / `Exposure Years`,
+         credibility_weighted_loss_cost = loss_cost*(loss_cost_credibility) + (1-loss_cost_credibility)*overall_loss_cost
+  ) %>%
+  mutate(rebased_credibility_weighted_loss_cost =
+           credibility_weighted_loss_cost /
+           max(ifelse( `Exposure Years` == max(`Exposure Years`), credibility_weighted_loss_cost, 0))
+  ) %>%
+  head() %>%
+  print()
+print("^ Example of one  of our tables: BI")
+```
+
+
+
+```{r, cache = TRUE}
+## DEFINE CREDIBILITY WEIGHTED FACTORS:
+
+## from pdf:
+severity_standards <- c("BI_SEVERITY" = 420, "COLL_SEVERITY" = 661, "COMP_SEVERITY" = 1487, "MP_SEVERITY" = 165,  "PD_SEVERITY" = 214, "UMBI_SEVERITY" = 407, "UMPD_SEVERITY" = 185)
+
+## implied coefficients of variation (squared)
+severity_coefficients_of_variation_2 <- severity_standards / cred_std_freq
+
+
+## loop over each coverage, right now each coverage has their own data frame
+for(i in grep(pattern = "SEVERITY", ls(), value = TRUE) ){
+  ## get coverage data
+  temp <- get(i)
+  
+  ## define overall loss cost for coverage
+  overall_loss_cost = sum(temp$Losses) / sum(temp$`Exposure Years`)
+  
+  ## there was a problem with the source data, fix here
+  temp <- tryCatch({
+    ## try to rename this column if its spelled wrong, if not do nothing
+    temp %>% rename(Credibility = Credibilty)
+    }, error = function(e) temp)
+  
+  ## get loss cost (or, pure premium), its partial credibility factor, and credibility weighted loss cost factor
+  temp <-
+    temp %>%
+    ## back out of the severity credibility factors they used
+    mutate(coef_var_2 = !!severity_coefficients_of_variation_2[i]) %>%
+    ## define our credibility weighted factors, using credibility for pure premium/aggregate loss/loss cost
+    mutate(loss_cost_partial_credibility_UNCAPPED = sqrt(`Claim Count`/(1+coef_var_2)/!!cred_std_freq),
+           loss_cost_partial_credibility = pmin( loss_cost_partial_credibility_UNCAPPED ,1),
+           loss_cost = Losses / `Exposure Years`,
+           credibility_weighted_loss_cost =
+             loss_cost*(loss_cost_partial_credibility) +
+             overall_loss_cost * (1-loss_cost_partial_credibility)
+    ) %>%
+    ## only move forward with these columns
+    select(Zipcode, `Exposure Years`, `Claim Count`, Losses, credibility_weighted_loss_cost, loss_cost_partial_credibility_UNCAPPED)
+  
+  ## assign output data to new object
+  ( assign_name <- gsub("_.*", "", i) )
+  assign(
+    assign_name,
+    temp)
+  
+  rm(temp) ; rm(assign_name)
+}
+
+
+## using same looping structure, we want to put all coverages in the same dataframe
+factors <-
+  lapply(X = grep(pattern = "SEVERITY", ls(), value = TRUE),
+         FUN = function(x){
+           ## get variables that we created in previous loop
+           x <- gsub("_.*", "", x)
+           ## get data frame
+           temp <- get(x)
+           temp <-
+             temp %>%
+             ## format column names
+             rename_with(.cols = colnames(.)[-1],
+                         .fn = ~paste0(x, "_", gsub(" ", "_", .))) %>%
+             ## go with better name for pricing factor
+             rename_with(.cols = contains("credibility_weighted_loss_cost"),
+                         .fn = ~paste0(x, "_pricing_factor"))
+           return(temp)
+         }
+  ) %>%
+  Reduce(f = function(x, y) left_join(x, y, by = "Zipcode"))
+
+factors %>%
+  head() %>%
+  print()
+
+```
+
+You'll notice that alot of our factors are huge, having pricing multipliers with large orders of magnitude. This is fine, because actuaries will set their rates such that once we multiply all of the possible pricing factors together (for example, ZIP code, vehicle age, gender), we will multiply the resulting coverage premium by a final "base rate", which is the same for all policies and is determined in order to appease some targeted average premium that we want to charge all of our customers. But this is still a little messy, so...
+
+
+
+### "Rebase" our pricing factors
+
+Finally we "rebase" these factors - because we will be multiplying our prices by these factors, it's sensible for them to have a mean value roughly around 1. We will find the ZIP code that has the most exposures, and set that as our "base level", which is the ZIP code that we will set factors to be 1, by dividing all factors by that ZIP code's factor. It's sensible to have your most populous ZIP code as the unity level, this makes other pricing actions that have to happen later on (such as determining the average price we want to target for our book of business) a much easier and clearer exercise.
+
+In particular, we will use sum of total BI and PD exposures (in each ZIP code) to set our base level, since all policies must have these coverages. The data is a little inconsistent, total exposures for BI and PD should be identical, but they're not - so we will use the sum of BI and PD exposures to set our base level instead.
+
+Find ZIP code that should be our base level, and rebase factors:
+
+```{r, cache = TRUE}
+## REBASE FACTORS
+
+#### TODO: INCLUDE?
+# ## get rid of claim counts, and exposures for all coverages except for BI and PD
+# factors <-
+#   factors %>%
+#   # select(-(contains("Losses") & !(starts_with("BI") | starts_with("PD")))) %>%
+#   select(-(contains("Claim") & !(starts_with("BI") | starts_with("PD")))) %>%
+#   select(-(contains("Exposure_Years") & !(starts_with("BI") | starts_with("PD"))))
+
+factors <-
+  factors %>%
+  ### perform our actuarial "rebasing"
+  ## set base level as ZIP code with most BI and PD exposures
+  mutate(BI_PD_exposures = BI_Exposure_Years + PD_Exposure_Years) %>% 
+  ## largest exposure ZIP: 90650  Norwalk's ZIP code, a suburb of Los Angeles
+  mutate(across(.cols = ends_with("pricing_factor"),
+                ## wrap in `max` to get value for entire column
+                .fns = ~. / max(ifelse(BI_PD_exposures == max(BI_PD_exposures), ., -1))
+                )) %>%
+  
+  ### Process data
+  ## some factors are NaN, because they had no information. Set these as 1.0's.
+  mutate(across(.cols = ends_with("pricing_factor"),
+                .fns = ~ifelse(is.na(.), 1.0, .)
+                )) %>%
+  ## these come from where loss amounts are 0. We want to pay attention to these later on to identify buckets where there is no exposure for our clustering. Set NA's to 0 as well.
+  mutate(across(.cols = contains("Losses") | contains("Exposure") | contains("credibility"),
+                .fns = ~ifelse(is.na(.), 0, .)
+                )) %>%
+  ## dont need this column anymore
+  select(-BI_PD_exposures)
+
+
+## here are our rebased pricing factors
+factors %>%
+  select(Zipcode, contains("pricing_factor")) %>%
+  mutate(across(.cols = everything(),
+                .fns = ~round(., 3))) %>%
+  head()
+```
+
+Now we are done finding our pricing factors. Let's take a look at them.
+
+
+### Visualize final rebased factors
+
+Here, we bring in ZIP code data so that we can make fancy plots of our factors.
+California ZIP codes were updated in 2008, our data from the CA DOI is from 2008 as well. The next time they were updated is 2011. 2008 errors with the ZIP code pull here, so we use 2010.
+
+Here, in our factors, there are a few ZIP codes that are missing (when comparing to the ZIP codes we bring in), for the sake of our analysis as an exercise, we disregard this and move forward - but if I were to do this rigorously, I would assign those missing values to have a factor of 1 (this is somewhat of a standard in the actuarial profession).
+
+
+```{r, cache = TRUE}
+
+## GET FACTOR QUANTILES
+lapply(X   = factors %>% select(contains("pricing_factor")),
+       FUN = function(x) quantile(x, seq(0,1,.1)))
+
+## PLOT FACTOR DISTRIBUTIONS
+suppressWarnings(
+  factors %>% 
+  select(contains("pricing_factor")) %>%
+  pivot_longer(cols = everything(),
+               names_to = "coverage",
+               values_to = "pricing_factor") %>%
+  ggplot(aes(x = pricing_factor)) +
+    geom_histogram(bins = 100) + facet_wrap(~coverage) +
+    ## impose a limit to make the plots prettier
+    xlim(c(0,2.5))
+)
+
+```
+
+
+
+
+
+
+
+```{r, cache = TRUE}
+### READ IN ZIP CODES, MAKE PLOTTING DATA
+ca_zips <- suppressMessages(
+  tigris::zctas(year = 2010, cb = TRUE, starts_with = c("90", "91", "92", "93", "94", "95", "96"),
+                progress_bar = FALSE)
+)
+ca_state <- tigris::states(cb = TRUE, year = 2010, progress_bar = FALSE) %>%
+  filter(NAME == "California")
+
+
+ca_zips <-
+  ca_zips %>%
+  mutate(ZCTA5 = as.numeric(ZCTA5)) %>%
+  filter(ZCTA5 > 90000 & ZCTA5 <= 96162)  ## range of CA zips
+
+ca_zips$ZCTA5 %>% unique %>% length()
+factors$Zipcode %>% unique %>% length()
+
+factors$BI_pricing_factor %>% quantile(seq(0,1,.1))
+factors$BI_pricing_factor %>% hist()
+log(factors$BI_pricing_factor) %>% hist()
+
+factors_plot <-
+  ca_zips %>%
+  inner_join(
+    factors,
+    by = c("ZCTA5" = "Zipcode")
+    )
+
+# factors_plot %>% head()
+
+```
+
+View full map of plots
+```{r, cache = TRUE}
+## FULL CALIFORNIA MAP
+coverages <- factors_plot %>% as.data.frame() %>% select(contains("pricing_factor")) %>% colnames()
+plots <- list()
+img_paths <- c()
+
+if(!exists("plots/")) dir.create("plots/")
+
+for(i in coverages){
+  p_full <- ggplot() +
+    geom_sf(data = factors_plot, aes(fill = !!sym(i)), color = "black", linewidth = 0.05) +
+    scale_fill_gradient2(low = "blue", mid = "gray90", high = "red",
+                         midpoint = 1,
+                         limits = range(factors_plot[[i]]),
+                         na.value = "white") +
+    theme_void() +
+    theme(legend.position = "none") +
+    ggtitle(i)
+  
+  # LA zoom map
+  p_LA <- ggplot() +
+    geom_sf(data = factors_plot, aes(fill = !!sym(i)), color = "black", linewidth = 0.05) +
+    scale_fill_gradient2(low = "blue", mid = "gray90", high = "red",
+                         midpoint = 1,
+                         limits = range(factors_plot[[i]]),
+                         na.value = "white") +
+    coord_sf(xlim = c(-119, -117.5), ylim = c(33.5, 34.25)) +
+    theme_void() +
+    ggtitle("Los Angeles")
+  
+  # SF zoom map
+  p_SF <- ggplot() +
+    geom_sf(data = factors_plot, aes(fill = !!sym(i)), color = "black", linewidth = 0.05) +
+    scale_fill_gradient2(low = "blue", mid = "gray90", high = "red",
+                         midpoint = 1,
+                         limits = range(factors_plot[[i]]),
+                         na.value = "white", guide = NULL) +
+    coord_sf(xlim = c(-122.75, -121.65), ylim = c(37.3, 38.3)) +
+    theme_void() +
+    ggtitle("San Fran")
+  
+  ## plot together
+  p <-
+    ggdraw() +
+    draw_plot(p_full) + # Base map
+    draw_plot(p_LA, x = 0.55, y = 0.55, width = 0.4, height = 0.4) +
+    draw_plot(p_SF, x = 0.65, y = 0.3, width = 0.25, height = 0.25)
+  rm(p_full) ; rm(p_LA) ; rm(p_SF)
+  
+  img_file <- paste0("plots/", i, ".png")
+  ggsave(img_file, plot = p, width = 8, height = 6, dpi = 150)
+  img_paths <- c(img_paths, img_file)
+  
+} ; rm(coverages)
+```
+
+<div style="max-width: 100%; margin-bottom: 50px;">
+```{r, cache=FALSE}
+slickR(img_paths)
+```
+</div>
+
+
+
+\[\space\]
+\[\space\]
+\[\space\]
+\[\space\]
+
+
+
+
+We see that primarily LA, and also some ZIP codes in SF account for most of the factors above 1, this seems sensible - most accidents (and therefore claims) happen to people living in densely populated areas with lots of traffic.
+
+At this point, in our analysis, we would be done and have our final pricing factors for each ZIP code.
+
+
+
+
+\[\space\]
+\[\space\]
+\[\space\]
+
+
+
+<hr>
+
+# Section B)  K-means clustering
+
+## Motivation:
+
+##### Upon completion of Section A, we have our final factors that we would implement in our pricing plan -- But there can be post-processing work that has to be done with such an analysis as well. Take for example, New York. I did a project at a previous role where I had to price territory factors for our New York pricing plan. I was given factors generated from a complex model (instead of an empirical analysis), and was tasked with the following problem:
+
+##### New York DOI requires that there can be no more than 150 unique "territories" that have their own pricing factors. 
+
+So instead of a table that looks like this:
+
+```{r, echo = TRUE}
+factors %>% select(Zipcode, contains("pricing_factor"))
+```
+
+with 1819 rows, we instead need one that has 150 rows (where the `Zipcode` column would become a group id that has some group of these ZIP codes)
+
+Here, we can consider our ZIP code factors to be the "perfect" price, and we have to find a way to assign ZIP codes to 150 groupings (territories) in such a way that the factors assigned for each coverage in that territory results in the least amount of *error*; we want to retain as much of the information in the original factors at the end of section A as possible. This is exactly a dimensionality-reduction problem. I identified that k-means clustering is the perfect tool for this problem.
+
+## Objective:
+
+##### For our exercise, in this section, I will update our pricing analysis as if this was a requirement in California using K-means clustering.
+
+
+**I will assume the reader has a decent understanding of the traditional k-means clustering algorithm.**
+
+\[\space\]
+
+## Use-case Considerations   
+
+##### Before continuing we must also consider, for our use case, there are a few caveats we want to address:
+
+* 0) In traditional k-means clustering, it's assumed we want to standardize our data, giving each variable mean 0 and variance 1. This creates the following behavior in the model:
+* 1) In traditional k-means clustering, each observation (ZIP code) will contribute equally to how we define which ZIP codes get grouped, and the resulting group's (cluster's) average factor that will be used as our new price
+* 2) In traditional k-means clustering, each variable (coverage) will also contribute equally to how we define which ZIP codes get grouped
+
+In our case here, we can see why that may not be ideal. Some ZIP codes will have a much higher population and therefore much more exposure, we would wont these to have more of a say in the factor that gets assigned to its cluster's final price. Also, some coverages are more *important* than others (since, for example, BI and PD are always chosen, but UMBI may be rarely chosen), so we would want these to be more determinant of how ZIP codes get assigned to clusters.
+
+We solve these problems with some tweaks to our algorithm. To solve our first (1) problem, we use a "weighted" k-means clustering algorithm instead of a standard k-means clustering - this uses weights assigned to each ZIP code to weight each observation's influence on assigning observations to clusters and computing the cluster centroid (which will be our new pricing factor). To solve our second (2) problem, I devised a clever and novel hack on the k-means clustering algorithm (which assumes input columns' means and variances are scaled to 0 and 1, respectively) that scales the variances based on how much *importance* we want to give each column (coverage). I will give my mathematical argument for why this works below, but to bring this all together; I find that the factor by which we scale a column's variance coincides one-to-one with the importance/influence that column has on determining where ZIP codes are grouped. That is, if our importance scales are 1 and 2, then the first column will have importance 1/(1+2) and the other will have importance 2/(1+2) - the second column will have 2x as much importance as the first!
+
+
+
+## 0. Scale (standardize) data 
+### (core assumption for k-means)
+
+Before addressing our 2 considerations, we have to prepare our data to get it to the point where it is ready for a traditional k-means clustering algorithm.
+
+K-means assumes that each of its variables are isotropic (think, spherical), in order to achieve this, we "standardize" our data, scaling it so that it has mean 0 and variance 1 (using the Central Limit Theorem, it becomes (roughly) a standard normal distribution).
+
+This assumption is rooted in the fact that the algorithm finds clusters that are spherical in hyper space, and is partially a consequence of the use of Euclidean Distance in the heart of its objective function. To perform optimally, and create results you would expect from the algorithm, the input data has to have clusters that possess this quality. (Though later you will see that we take advantage of this construction to relax this assumption and make an even more powerful algorithm).
+
+Scale our data:
+
+```{r, cache = TRUE}
+## STANDARDIZE EACH OF OUR VARIABLES
+
+## Save these original means & variances to back out of this transformation after fitting k-means
+original_scales_ <-
+  factors %>%
+  summarize(across(.cols = contains("pricing_factor"),
+                   .fns = tibble::lst(mean, sd),
+                   .names = "{fn}_{col}"
+                   ))
+
+factors_scaled <-
+  factors %>%
+  mutate(across(.cols = contains("pricing_factor"),
+                   .fns = ~(. - mean(.)) / sd(.)
+                ))
+
+## View
+factors_scaled %>%
+  pivot_longer(cols = contains("pricing_factor"), names_to = "coverage", values_to = "pricing_factor") %>%
+  # filter(!Losses %in% c(0, NA)) %>%
+  mutate(coverage = gsub("_.*", "", coverage)) %>%
+  ggplot(aes(x = pricing_factor, fill = coverage)) + geom_density(alpha = .5) +
+  ggtitle("Distribution of factors should be roughly standard normal now", subtitle = "(You can see that they are)")
+```
+
+
+
+
+## 1. Get Weights for k-means algorithm
+
+##### So we've identified in the first of the two problems posed in the beginning of section B that we need to construct weights to weight each observation. But what measure shall we use to accomplish this? This is a delicate question, and careful consideration should be taken to determine this.
+
+
+It's sensible to consider that our weights for each ZIP code should be determined by some type of size metric - for example, the size of the population, or, number of policies written (roughly, exposure). Here, we can either choose exposure or claim count.
+
+First, we want to ask, should we use an element (say, exposure) pertaining to a single coverage, or some element that represents an aggregation of all coverages, within a ZIP code?
+
+Consider exposure. Exposure for a single policy should be either 1 or 0 for each coverage. For BI and PD, it will always be 1 since they are compulsory coverages. I'll assume a constant distribution of selections of coverages per policy within each ZIP code. But when we dive into the data we see this is actually not the case (to a big degree), but it would drastically simplify our decision making.
+
+```{r}
+#### LET'S VIEW THIS ^ ANOMALY
+
+## distribution of relative exposure within each ZIP code
+factors_scaled %>%
+  rowwise() %>%
+  transmute(across(.cols = contains("Exposure"),
+                   .fns = ~pmin(. / PD_Exposure_Years, 1))) %>% ## use pmin because there are ~3 ZIP's that have COMP and COLL exposures higher than PD exposures (I assume this to be an error, and it doesn't affect our analysis anywhere else (except for credibility constants, but in those cases, the COMP and COLL exposures were probably already high enough to get a credibility compliment of 1 - I could revisit this in section A but won't bother, for the sake of brevity (I'd have to make some sort of assumption and selection regardless))) 
+  ungroup() %>%
+  as.data.frame() %>%
+  pivot_longer(cols = everything(),
+               names_to = "coverage",
+               values_to = "exposure") %>%
+  mutate(coverage = gsub("_Exposure_Years", "", coverage)) %>%
+  ggplot(aes(x = exposure, y = coverage, fill = coverage)) +
+  geom_density_ridges(stat = "binline", bins = 100, scale = 1, draw_baseline = F, alpha = 0.7) +
+  labs(title = "Distribution of relative exposure within each ZIP code",
+       x = "Exposure Years", y = "Coverage") +
+  theme(legend.position = "none")
+## seeing flat dist's right off the bat is pretty much the opposite of what we wanted to see
+### We'd like to see them centered around the same point (except for BI and PD), but they definitely don't have the same centers; this confirms what we were saying above.
+```
+
+Given this, if we use the sum of all exposures as our weight (instead of just one coverage's exposures), it exacerbates violation of this assumption (when the distributions change), and we don't want to price for that because credibility already accounts for this when dist of exposures across coverages are less than expected!
+
+Diving into this, if we have, say, a typical distribution of exposures across coverages, and we cluster that observation with something that has distribution "higher" than typical, then the higher than typical observation will double count and pull the other observations even further into it in the clustering (i.e. it will have more importance), our credibility weighting of factors in section A already does this! ("Higher" than typical distribution means that the distribution of how often optional coverages are selected relative to compulsory coverages increases.)
+On the other hand, if we have a typical distribution of exposures across coverages, and we cluster that observation with something that has distribution lower than usual, then the same will happen, credibility will be double counted (now in the opposite direction).
+
+Thus, it is better to focus on a weighting element that pertains to one selected coverage to represent the weight for that entire ZIP code, rather than something that aggregates across all coverages, because aggregating somewhat double counts the credibility weighting used before. But it is still a drawback that a single coverage has to account for all of the coverages in the weighting, when you consider that these distributions for exposures are far from being constant within each ZIP code. 
+
+This same problem of aggregating exists for claim counts, but actually, this 
+
+This same problem, and what we've identified, can be said if we replace exposure with claim count. 
+
+So, let us now consider claim count, it, unlike exposure, isn't 0 or 1 for a policy anymore. We can also assume that coverages' claim frequencies have same distribution across zips like we do for exposures, BUT we can see from the data that this is actually a far better assumption than assuming that exposures per policy follow the same distribution for each coverage. For this reason, we are comfortable with using claim count instead of exposure for the weights! And this is *whether or not we wanted to aggregate claim count across coverages or just use one coverage's claim count as the weight*, though we already identified that aggregating is undesirable regardless of measure (exposure or claim count).
+
+So we will use claim count instead of exposure. But we want to standardize claim count in such a way that we can cap it (we don't want the variance of weights to be too high, then the clusters would be too dominated by highly weighted ZIP codes), this is exactly what our credibility factors (not to be confused with pricing factors) do! An added bonus of our credibility factors is they are capped at 1, which is when there are enough claims such that the reliability of the frequency distribution is deemed to be fully representative of the population - it makes sense that we would want to treat all fully credible ZIP codes the same.
+
+##### So we will use credibility factors, and in particular, just the credibility factor for PD, which is a compulsory coverage and is itself the most credible coverage.
+
+```{r}
+## use `factors$PD_loss_cost_partial_credibility_UNCAPPED` as our weights
+
+## it is (uncapped) credibility for loss cost, but is a function of claim counts
+## uncapped credibility measure allows for full dimension across weights, rather than capping them and treating observations above the capping value as the same
+(factors$PD_loss_cost_partial_credibility_UNCAPPED == 0) %>% sum(na.rm = T) ## and drop 7 observations
+hist(factors$PD_loss_cost_partial_credibility_UNCAPPED, main = "Histogram of weights")
+```
+
+
+
+
+
+## 2. Re-scale factors' variances (impose an *importance* on each coverage)
+
+### Motivation:
+
+##### As stated before, it may be that we want different coverages to be more important in determining these which ZIP codes get mapped to the 150 different territories. We will do so in this section, but first I will detail a theory I've created that shows how can determine mathemtically how much we importance we are actually giving each variable.
+
+### Theory:
+
+#### Setup
+
+Let's define:
+
+* $X \in \mathbb{R}^{n \times d}$: data set with $n$ observations and $d$ features
+* $w_i$: weights for each observation $i$
+* $\mu_k \in \mathbb{R}^d$: centroid of cluster k
+* $C_1, ..., C_k$: partition of the data observations into $K$ clusters
+* Assume each variable $x_j$ has be standardized to mean 0 and variance 1 (starting point of k-means)
+* Then we scale each variable $x_j$ by scalar $\sqrt{a_j}$, so that
+\[x_{ij}^\text{(scaled)} = \sqrt{a_j} \cdot x_{ij}^{\text{(original)}}\]
+
+Then:
+\[\text{Var}(x_{ij}^\text{(scaled)}) = a_j \cdot \text{Var}(x_{ij}^{\text{(original)}})\]
+
+#### K-means Objective Function
+
+The within-cluster sum of squared distances (WCSS) for weighted k-means clustering is
+
+\[\text{WCSS} = \sum^K_{k=1} \sum_{i \in C_k} w_i \sum^d_{j=1} (x_{ij} - \mu_{kj})^2 \]
+
+This is the same as computing a weighted sum of squared distances.
+
+Now we plug in the fact that $x_{ij} = \sqrt{a_j} \cdot z_{ij}$ where $z_{ij}$ is the original standardized data. Then, factoring:
+
+\[\text{WCSS}^{(w)} = \sum^K_{k=1} \sum_{i \in C_k} w_i \sum^d_{j=1} (\sqrt{a_j} \cdot z_{ij} - \sqrt{a_j} \cdot \bar{z}^{(w)}_{kj} )^2 = \sum^d_{j=1} a_j \Bigg[ \sum^K_{k=1} \sum_{i \in C_k} w_i \cdot (z_{ij} - \bar{z}^{(w)}_{kj} )^2 \Bigg]\]
+
+Now define:
+
+<!-- \[\text{WCSS}^{(w)} = \sum^d_{j=1} a_j \cdot \Bigg[ \sum^K_{k=1} \sum_{i \in C_i} w_i \cdot (z_{ij} - \bar{z}^{(w)}_{kj})^2 \Bigg] = \sum^d_{j=1} a_j \cdot \text{WCSS}^{(w)}_{j} \] -->
+\[\text{WCSS}^{(w)}_j = \sum^K_{k=1} \sum_{i \in C_i} w_i \cdot (z_{ij} - \bar{z}^{(w)}_{kj})^2 \]
+
+Where $WCSS_j$ is the within-cluster sum of squares for feature $j$ on the standardized scale.
+
+This equation:
+
+\[ \text{WCSS}^{(w)} = \sum^d_{j=1} a_j \cdot \text{WCSS}_j^{(w)} \]
+
+Shows that:
+* The total objective is a linear combination of the variance scalars $a_j$
+* The The weights in this linear combination — WCSS_$j$ - depend only on the data and clustering.
+* Therefore, scaling variance by $a_j$ increases that feature's contribution to the loss linearly, independently, and proportionally.
+
+
+#### Result
+Therefore, the scalars we multiply the variances by are not arbitrary: they are direct, one-to-one controls over how much each dimension shapes the space, the clusters, and ultimately, the optimization landscape of k-means.
+
+In application, if our variance scales that we apply to each column are some vector, $\vec{a}$, then the importance for column $i$ is expressed as $\frac{a_i}{\sum{a}}$, or, equivalently, the importances are expressed by the ratios $a_1 : a_2 : \space ... \space  : a_j$.
+
+Note that multiplying a random variable by scalar $a$ scales variance by a factor of $a^2$, so in practice we construct our variance scales $a$, then multiply the columns, for their corresponding j, by $\sqrt{a_j}$ to scale their variance by $a$.
+
+
+
+
+## Implement re-scaling of factors
+
+Now that we know that we can exploit this nice quality of the k-means clustering algorithm, we must choose our scales. Because our pricing factors are constructed to represent the relativistic change in loss cost, we will use average loss costs by coverage as the scales. We will see that some coverages have loss costs that far out-weigh others, this is due to disproportionate severities and frequencies. If we use the ratio of each coverage's total loss costs as our scales, then some small coverages would be drowned out (like UMPD), so we make an "actuarial selection" and set a lower bound that these variance scales can have at 10% of the highest variance scale.
+
+Implement:
+
+```{r, cache = TRUE}
+## DEFINE VARIANCE SCALES
+scales_ <-
+  factors %>%
+  ## get each coverages total loss cost
+  summarize(across(.cols = contains("Losses"),
+                   .fns = ~sum(., na.rm = TRUE) /
+                     sum(get(gsub("_Losses", "_Exposure_Years", cur_column())), na.rm = T))) %>%
+  ## divide each coverage loss cost by maximum loss cost
+  mutate(across(.cols = everything(),
+                .fns = ~. / max(across(everything())))) %>%
+  as.data.frame() %>%
+  ## actuarial judgement: UMPD and some other small coverages are so small, don't let them get drowned out
+  ## set minimum scale ratio to be 10% of largest coverage's scale
+  mutate(across(.cols = everything(),
+                .fns = ~pmax(., 0.1))) %>%
+  ## rescale so that smallest variance scale factor is 1
+  mutate(across(.cols = everything(),
+                .fns = ~. / min(across(everything()))))
+print(scales_)
+## ^ THESE ARE OUR SELECTED VARIANCE SCALES
+```
+
+
+
+\[\space\]
+
+### Perform Clustering Analysis
+
+```{r, cache = TRUE}
+
+## DEFINE CLUSTERING INPUT DATA (must be a matrix of our pricing factors)
+input <-
+  factors_scaled %>%
+  select(contains("pricing_factor")) %>%
+  as.matrix()
+input_cols <- colnames(input)
+input %>% nrow()
+
+## APPLY OUR VARIANCE SCALES (these scales represent what we want our columns' variances to be)
+
+## we apply the sqrt of the scales to the variable, this mathematically makes the new variances equal to our `scales_`
+input <-
+  t( t(input) * sqrt(c(as.matrix(scales_))) )
+# %>% as.data.frame %>% summarize(across(.fns = var))  ## <- use this to check if variances were applied properly
+# print(scales_)
+```
+
+```{r}
+## APPLY WEIGHTS (this is done when fitting)
+##  Some are zero (where ZIP codes had no claims)...
+
+# which(factors_scaled$PD_loss_cost_partial_credibility_UNCAPPED == 0)
+sum(factors_scaled$PD_loss_cost_partial_credibility_UNCAPPED == 0)
+```
+
+Finally, we see that some observations (ZIP codes) have weight = 0. We will exclude them from our analysis, and say that they simply wont be included in our pricing. That is, for completeness, actuarially, we could say for this project, for simplicity's sake: these ZIP codes are not offered in our product due to zero pricing information, and instruct Underwriters to not accept any policies in these ZIP codes.
+
+#### Run clustering algorithm
+
+```{r, cache = TRUE}
+## I iterated through multiple options of cluster amounts. New York requires that **at most** 150 territories are used, it never said you had to use exactly 150.
+
+# ## fit k-means based on different cluster amounts k
+# for(i in 145:150){
+#   temp <-
+#     SWKM::kmeans.weight(x = input,
+#                         weight = factors$PD_loss_cost_partial_credibility_UNCAPPED,
+#                         K = i,
+#                         nstart = 100)
+#   assign( paste0("clustering_", i),
+#           temp )
+# }
+# 
+# ## compare results
+# for(i in 145:150){
+#   print(paste0("num territories = ", i))
+#   temp <- get( paste0("clustering_", i) )
+#   print(temp$wcss)
+#   print("------------")
+# }
+
+## best performers: 150 and 145.
+## we can compare `wcss` because it is summing weighted distance (from observation to centriod) over all observations - the basis is unchanged by number of clusters, $k$, chosen.
+
+## ^ After doing this, it was determined that the best option is in fact 150 territories
+```
+
+
+
+```{r, cache = TRUE}
+### RUN OUR K-MEANS CLUSTERING ALGORITHM
+
+## RUN WEIGHTED K-MEANS CLUSTERING
+## this algorithm automatically excludes observations that have weight = 0
+set.seed(28)
+clustering_150 <-
+  SWKM::kmeans.weight(x = input,
+                      weight = factors$PD_loss_cost_partial_credibility_UNCAPPED,
+                      K = 150,
+                      nstart = 100)
+
+## (run the exact same k-means clustering algorithm, only don't use any weights)
+##  save this for later...
+set.seed(28)
+clustering_150_no_weight <-
+  SWKM::kmeans.weight(x = input,
+                      weight = rep(1, nrow(input)),
+                      K = 150,
+                      nstart = 100)
+set.seed(NULL)
+```
+
+
+
+
+## View clustering results
+
+```{r, cache = TRUE}
+## PREPARE FOR PLOTTING+
+## join our new factors onto their ZIP codes and also the geography objects we need to make these nice plots
+factors_plot <-
+  ca_zips %>%
+  ## right join because we want to keep `class` attribute "sf" for `ca_zips` in result,
+  ##  but we want to left join onto ZIP codes in `factors_scaled`
+  right_join(
+    factors_scaled,
+    by = c("ZCTA5" = "Zipcode")
+    ) %>%
+  filter(PD_loss_cost_partial_credibility_UNCAPPED != 0) %>%
+  cbind(
+    data.frame(
+      cluster_id = clustering_150$cluster[,1]
+    )
+  ) %>%
+  group_by(cluster_id) %>%
+  mutate(cluster_size = n()) %>%
+  ungroup() %>%
+  arrange(desc(cluster_size)) %>%
+  mutate(cluster_size_cum_desc = 1,
+         cluster_size_cum_desc = cumsum(cluster_size_cum_desc)) %>%
+  group_by(cluster_id) %>%
+  mutate(cluster_size_cum_desc = max(cluster_size_cum_desc)) %>%
+  ungroup() %>%
+  arrange(cluster_size_cum_desc) %>%
+  mutate(cluster_index_desc_sort = data.table::rleid(cluster_id))
+
+
+factors_plot_temp <-
+  factors_plot %>%
+  filter(cluster_size_cum_desc <= 400) %>%
+  mutate(cluster_id = as.character(cluster_id))
+
+helper_temp <-
+  factors_plot_temp %>% 
+  as.data.frame() %>%
+  select(cluster_size, cluster_id) %>%
+  unique()
+  
+legend_labels <- setNames(paste0(as.character(helper_temp$cluster_id), ": ", as.character(helper_temp$cluster_size)),
+                          nm = as.character(helper_temp$cluster_id)
+                          )
+
+factors_plot_temp %>%
+  ggplot() +
+  geom_sf(aes(fill = cluster_id),
+          color = "black", linewidth = 0.05) +
+  scale_fill_manual(
+    values = scales::hue_pal()(nrow(helper_temp)),
+    labels = legend_labels,
+    name = "cluster ID: cluster size"
+  ) +
+  geom_sf(data = ca_state, fill = NA, color = "black", linewidth = 0.5) +
+  ggtitle("7 Biggest clusters")
+```
+
+These are hard to view. If I plotted a map with all 150 clusters, there wouldn't be enough colors or even patterns to make any sense of the clustering. Note that it doesn't necessarily matter that the ZIP codes within each cluster are far apart from eachother geographically, what matters is that the algorithm found the optimal cluster to reduce the error in the reassignment of their factors (we can be certain k-means does this, with sufficient number of starting points). 
+
+We could have tried a number of clusters far below 145, in hopes that it would produce a result with less error (WCSS), but that is somewhat unlikely. I would leave that as something extra to be tested for future iterations of this project.
+
+Because these are hard to view, we will focus on the error metric itself, and try to make sense of how good of a job our clustering algorithm did.
+
+```{r, cache = TRUE, eval = FALSE, echo = FALSE}
+library(gganimate)
+p <-
+  ggplot(factors_plot, aes(fill = as.character(cluster_id))) +
+  geom_sf(color = "black", linewidth = 0.05) +
+  geom_sf(data = ca_state, fill = NA, color = "black", linewidth = 0.5) +
+  theme(legend.position = "none") +
+  transition_manual(cluster_id)
+animate(p, fps = 1.5) 
+rm(p)
+
+
+# centroids <- st_centroid(factors_plot)
+# ggplot() +
+#   geom_sf(data = ca_state, fill = "white", color = "black") +
+#   geom_sf(data = centroids, aes(color = cluster_id), size = 1.5) +
+#   theme_void()
+```
+
+
+
+```{r, cache = TRUE, eval = FALSE, echo = FALSE}
+# library(leaflet)
+factors_plot_temp <-
+  factors_plot %>%
+  mutate(cluster_id = as.character(cluster_id))
+pal <- colorFactor(palette = "Set3", domain = factors_plot_temp$cluster_id)
+factors_plot_temp %>%
+  leaflet() %>%
+  addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(
+    fillColor = ~pal(cluster_id),
+    color = "black", weight = 0.5, fillOpacity = 0.6,
+    popup = ~paste("Cluster:", cluster_id)
+  ) %>%
+  setMaxBounds(-124.5, 32.5, -113.9, 42) %>%
+  fitBounds(-124.5, 32.5, -113.9, 42)
+```
+
+
+```{r, cache = TRUE, eval = FALSE, echo = FALSE}
+
+p_full <-
+  factors_plot %>%
+  mutate(cluster_id = as.character(cluster_id)) %>%
+  ggplot() +
+  geom_sf(aes(fill = cluster_id), color = "black", linewidth = 0.05) +
+  scale_fill_gradient(low = "blue", high = "red", na.value = "gray90") +
+  theme_void() +
+  theme(legend.position = "none")
+
+# LA zoom map
+p_LA <-
+  factors_plot %>%
+  mutate(cluster_id = as.character(cluster_id)) %>%
+  ggplot() +
+  geom_sf(aes(fill = cluster_id), color = "black", linewidth = 0.05) +
+  coord_sf(xlim = c(-119, -117.5), ylim = c(33.5, 34.25)) +
+  theme_void()
+
+p_SF <-
+  factors_plot %>%
+  mutate(cluster_id = as.character(cluster_id)) %>%
+  ggplot() +
+  geom_sf(aes(fill = cluster_id), color = "black", linewidth = 0.05) +
+  scale_fill_gradient(low = "blue", high = "red", na.value = "gray90", guide = NULL) +
+  coord_sf(xlim = c(-122.75, -121.65), ylim = c(37.3, 38.3)) +
+  theme_void()
+
+library(cowplot)
+
+ggdraw() +
+  draw_plot(p_full) +  # Base map
+  draw_plot(p_LA, x = 0.55, y = 0.55, width = 0.4, height = 0.4) +
+  draw_plot(p_SF, x = 0.65, y = 0.35, width = 0.25, height = 0.25)
+
+
+###### lol
+```
+
+
+
+
+
+
+
+
+
+
+
+
+\[\space\]
+
+
+
+### Compare our clustering results (Section B output) with the original factors (Section A output)
+
+#### We need to process the clustering results to put them back in same mean/variance scale as the original pricing factors
+
+
+
+```{r, cache = TRUE}
+## WRANGLE CLUSTERING RESULTS BACK INTO OUR USUAL FACTORS DATAFRAME FORMAT.
+
+##  conserve code, use a function
+get_factors <- function(CLUSTERING_RUN_, ORIGINAL_FACTORS_, weights_ind, COLS_ = input_cols, SCALES_ = scales_, ORIGINAL_SCALES_ = original_scales_){
+  
+  ## get vector of each row in our input df's corrsponding assigned cluster id
+  CLUSTERING_RUN_$cluster %>%
+  as.data.frame() %>%
+  `colnames<-`("cluster_id") %>%
+  
+  ## join on the cluster centroids
+  left_join(
+    CLUSTERING_RUN_$centers %>% as.data.frame() %>% rowid_to_column(),
+    by = c("cluster_id" = "rowid")
+  ) %>%
+  
+  ## join on ZIP codes 
+  cbind(
+    ORIGINAL_FACTORS_ %>%
+      ## correct for where algorithm didn't price because there were ZIP's with no exposure
+      ## (when weight = 0)
+      filter(PD_loss_cost_partial_credibility_UNCAPPED != !!weights_ind) %>%
+      select(Zipcode)
+  ) %>%
+  
+  ## format; add column names
+  relocate(Zipcode, before = colnames(.)[1]) %>%
+  `colnames<-`(c("Zipcode", "cluster_id", COLS_)) %>%
+  
+  ## undo scaling variances
+  tidyr::nest(
+    ## nesting everything optimizes performance. Adding this allows nested data to be all rows
+    ids = !contains("pricing_factor"),
+    ## so we add that ^ even tho we only wanna perform operations on this :
+    data = contains("pricing_factor")) %>%
+  mutate(data = purrr::map(data,
+                           ~as.data.frame(
+                             t( t(as.matrix(.)) * (sqrt(c(as.matrix( SCALES_ ))))^-1 )
+                             )
+                          )) %>% 
+  
+  ## undo standardizing
+  mutate(data = purrr::map(data,
+                           ~as.data.frame(
+                             t( t(as.matrix(.)) *
+                                  unlist(
+                                    rename_with(select(ORIGINAL_SCALES_,
+                                                       contains("sd_")),
+                                                .fn = ~gsub("sd_", "", .)))
+                                )
+                           )
+  )) %>%
+  mutate(data = purrr::map(data,
+                           ~as.data.frame(
+                             sweep(
+                               x      = as.matrix(.),
+                               MARGIN = 2,
+                               STATS  = unlist( rename_with(select( ORIGINAL_SCALES_ , contains("mean_")), .fn = ~gsub("mean_", "", .)) ),
+                               FUN    = `+`
+                             )
+                           )
+  )) %>%
+  
+  ## finish
+  tidyr::unnest(cols = everything())
+}
+
+
+## create factors data frame for our weighted k-means clustering algorithm run
+clustered_factors <-
+  get_factors( clustering_150, factors, weights_ind = 0 )
+
+## create factors data frame for our UN-WEIGHTED k-means clustering algorithm run (more on this one later...)
+clustered_factors_no_weight_in_algo <-
+  get_factors( clustering_150_no_weight, factors, weights_ind = -1 )
+
+print( clustered_factors )
+```
+
+
+
+
+```{r, cache = TRUE}
+## JOIN NEW FACTORS ONTO OLD FACTORS
+
+## bring in our original factors from the end of Section A
+original_factors <-
+  factors %>%
+  filter(PD_loss_cost_partial_credibility_UNCAPPED != 0) %>%
+  ## for the remainder of the analysis, we only need these columns
+  select(Zipcode, contains("factor"))
+
+## join the factors before and after Section B together in these objects
+factors_compare <-
+  clustered_factors %>%
+    rename_with(.cols = colnames(.)[-1],
+                .fn = ~paste0(., "_clustered")) %>%
+  left_join(
+    original_factors %>%
+    rename_with(.cols = colnames(.)[-1],
+                .fn = ~paste0(., "_original")),
+    by = "Zipcode"
+  )
+
+factors_plot2 <-
+  right_join(
+    x = ca_zips,
+    y = 
+      ( select(clustered_factors, -cluster_id) - original_factors ) %>%
+      mutate(Zipcode = clustered_factors$Zipcode),
+    by = c("ZCTA5" = "Zipcode")
+  )
+```
+
+
+
+##### Now we are ready to compare Section B to Section A's factors! Generate our error metrics:
+
+```{r, cache = TRUE}
+
+factors_compare %>%
+  mutate(
+    weight = 
+      (factors %>%
+      filter(PD_loss_cost_partial_credibility_UNCAPPED != 0) %>%
+      pull(PD_loss_cost_partial_credibility_UNCAPPED))
+  ) %>%
+  pivot_longer(cols = contains("factor")) %>%
+  mutate(name = gsub("pricing_factor_", "", name)) %>%
+  separate(name, into = c("coverage", "measure"), sep = "_") %>%
+  pivot_wider(names_from = measure, values_from = value) %>%
+  mutate(abs_diff = abs(clustered - original),
+         squared_diff = (clustered - original)^2) %>%
+  group_by(coverage) %>%
+  summarize(w_mae = round(weighted.mean(abs_diff, weight),4),
+            mae = round(mean(abs_diff),4),
+            diff_mae = w_mae - mae,
+            w_mse = round(weighted.mean(squared_diff, weight),4),
+            mse = round(mean(squared_diff),4),
+            diff_mse = w_mse - mse
+            )
+```
+
+<!-- ##### These results are awesome. Average absolute error for our large coverages (like COLL and PD) are very low, with factors changing in value by .023 and .031, on average (respectively). The weighted mean error metrics are even more favorable than the raw mean error metrics, showing that our weighted k-means gave proper importance value to each ZIP code. The fact that errors are lower for our large coverages shows that the re-scaling worked to successfully implement our importance scales to each coverage as well. -->
+
+
+These results look good on the surface. Mean absolute error (MAE) for our large coverages (like COLL and PD) are very low (if a factor differs on average by (for PD) $\pm$0.033, that seems like a great start. The fact that errors are lower for our large coverages shows that the re-scaling worked to successfully implement our importance scales to each coverage as well. I like to consult mean absolute error metrics instead of mean squared error because it's easier to interpret and relate to our use case (i.e., this is how far away on average our factors move after clustering), but do note that (weighted) mean squared error is what the algorithm uses in its objective function (for determining cluster assignments *and* centroids).
+
+When we dive into these metrics, a glaring problem arises; this is a big problem we will have to investigate: the weighted mean error metrics are worse than the raw mean error metrics, showing that our weighted k-means was unable to give more importance to the ZIP codes with higher weight. That is, the observations with higher weights had their factors changed more than those with smaller weights, which is the opposite of what we expected to see, when you consider that the algorithm attempts to accomplish this with its objective function.
+
+
+Let's try to diagnose this problem by inspecting our data:
+
+```{r}
+
+p <-
+  factors_compare %>%
+    mutate(
+        weight = 
+            (factors %>%
+                 filter(PD_loss_cost_partial_credibility_UNCAPPED != 0) %>%
+                 pull(PD_loss_cost_partial_credibility_UNCAPPED))
+    ) %>%
+    pivot_longer(cols = contains("factor")) %>%
+    mutate(name = gsub("pricing_factor_", "", name)) %>%
+    separate(name, into = c("coverage", "measure"), sep = "_") %>%
+    pivot_wider(names_from = measure, values_from = value) %>%
+    mutate(abs_diff = abs(clustered - original),
+           squared_diff = (clustered - original)^2) %>% filter(coverage == "COLL") %>% arrange(weight) %>% mutate(ind = 1:n()) %>% ggplot(aes(x = log(weight), y = abs_diff, color = original)) + geom_point(alpha = .5) + geom_smooth(method = 'gam', formula = 'y ~ s(x, bs = "cs")') + scale_color_gradient2(low = "red", high = "blue", mid = "gray", midpoint = 1)
+
+suppressWarnings(
+  ggExtra::ggMarginal(p, type = "histogram", margins = "x")
+)
+### ^ HIGHER WEIGHTS SHOULD HAVE LOWER ERRORS ON AVERAGE. WE SEE THE OPPOSITE OF THIS. 
+
+
+factors_compare %>%
+    mutate(
+        weight = 
+            (factors %>%
+                 filter(PD_loss_cost_partial_credibility_UNCAPPED != 0) %>%
+                 pull(PD_loss_cost_partial_credibility_UNCAPPED))
+    ) %>%
+    pivot_longer(cols = contains("factor")) %>%
+    mutate(name = gsub("pricing_factor_", "", name)) %>%
+    separate(name, into = c("coverage", "measure"), sep = "_") %>%
+    pivot_wider(names_from = measure, values_from = value) %>%
+    mutate(abs_diff = abs(clustered - original),
+           squared_diff = (clustered - original)^2) %>% filter(coverage == "COLL") %>%
+  summarize(cor(abs_diff, weight))
+### ^ HIGHER WEIGHTS IN OUR DATASET ARE CORRELATED WITH GREATER DIFFERENCE BEFORE AND AFTER (THIS IS JUST A GUT CHECK TO ENSURE OUR ALGORITHM AND DATA TRANSFORMATIONS RAN PROPERLY)
+
+
+factors_compare %>%
+    mutate(
+        weight = 
+            (factors %>%
+                 filter(PD_loss_cost_partial_credibility_UNCAPPED != 0) %>%
+                 pull(PD_loss_cost_partial_credibility_UNCAPPED))
+    ) %>%
+    pivot_longer(cols = contains("factor")) %>%
+    mutate(name = gsub("pricing_factor_", "", name)) %>%
+    separate(name, into = c("coverage", "measure"), sep = "_") %>%
+    pivot_wider(names_from = measure, values_from = value) %>%
+    mutate(abs_diff = abs(clustered - original),
+           squared_diff = (clustered - original)^2) %>% filter(coverage == "COLL") %>% arrange(weight) %>% mutate(ind = 1:n()) %>% ggplot(aes(x = original, y = clustered, color = weight)) + geom_point() + scale_color_gradient(low = "red", high = "blue") + geom_abline(slope = 1, intercept = 0) + ggtitle("COLL observations\nbelow black line means factor was decreased, above means increased")
+## HARD TO REALLY DISCERN ANYTHING ELSE ABOUT OUR DATA FROM THIS PLOT ^ BUT WAS WORTH A TRY
+```
+
+
+These views don't really help us to figure out why this problem is happening, but they do echo the fact that this is certainly happening in our data.
+
+Upon inspection of the code, we are certain the algorithm is applied properly. And with these data visualizations, we see how (but not why) the problem is occuring.  So let us now compare these results to the same k-means algorithm run where we do not use weights (I ran and stored this above as an object with `clustering_150_no_weight`). Lets look at these same metrics and how they perform with this run.
+
+
+#### Just like for the clustering run with weights, we will first process the clustering results (with no weights) to put them back in same mean/variance scale as the original pricing factors 
+
+We will compare both clustering run, and choose the best result. Namely, we want to get to the bottom of what is happening with the weighted MSE/MAE being worse than the raw MSE/MAE values.
+
+
+```{r}
+
+## for an apples to apples comparison, we will make sure only the same observations are in both output datasets
+factors_compare_no_weight_in_algo <-
+  clustered_factors_no_weight_in_algo %>%
+    rename_with(.cols = colnames(.)[-1],
+                .fn = ~paste0(., "_clustered")) %>%
+  left_join(
+    original_factors %>%
+    rename_with(.cols = colnames(.)[-1],
+                .fn = ~paste0(., "_original")),
+    by = "Zipcode"
+  ) %>%
+  left_join(
+    factors %>%
+      select(Zipcode, PD_loss_cost_partial_credibility_UNCAPPED),
+    by = "Zipcode"
+  ) %>%
+  ## apply observation filter here
+  filter(PD_loss_cost_partial_credibility_UNCAPPED != 0)
+
+
+## get our error metrics
+factors_compare_no_weight_in_algo %>%
+  rename(weight = PD_loss_cost_partial_credibility_UNCAPPED) %>%
+  pivot_longer(cols = contains("factor")) %>%
+  mutate(name = gsub("pricing_factor_", "", name)) %>%
+  separate(name, into = c("coverage", "measure"), sep = "_") %>%
+  pivot_wider(names_from = measure, values_from = value) %>%
+  mutate(abs_diff = abs(clustered - original),
+         squared_diff = (clustered - original)^2) %>%
+  group_by(coverage) %>%
+  summarize(w_mae = round(weighted.mean(abs_diff, weight),4),
+            mae = round(mean(abs_diff),4),
+            diff_mae = w_mae - mae,
+            w_mse = round(weighted.mean(squared_diff, weight),4),
+            mse = round(mean(squared_diff),4),
+            diff_mse = w_mse - mse
+            )
+```
+
+Okay, we see here that when we don't fit k-means clustering with weights, then all of our mean error metrics (weighted and unweighted) get worse. This reinforces the initial inclination that weighted k-means would be preferable to k-means without weights; it means that our algorithm **does** do it's job in giving more importance to observations with higher weight (in determining clusters and centroids). This all does beg the question: why do our weighted mean error measures perform worse than unweighted error measures? When you consider all of our output, and also the formulation of the algorithm's fitting in general, then it becomes apparent that this is just due to the structure of our data itself:
+
+* Strong observations (outliers) with higher weights are simply harder to fit (error is correlated positively with weight)
+* The re-scaling dominates/overrides the importance that weighting tries to assign (especially in cases with large differences in scales, we do see that the range of scales in our data is 10:1).
+  - Though, based on our use case and the motivation we laid out, it is still favorable that we impose these variance scales before the algorithm is ran. And again, we do see that weighted k-means out-performs unweighted.
+  
+**For these reasons, and upon consulting these error metric comparisons, we consider our weighted k-means clustering fit a success.** Recall, in our use-case, it is a requirement that we reduce the dimension of our factors to at most 150 territories, and I reckon this is still the most favorable way to do that;  no matter what, we will always have to deal with some non-zero error, I assert that this is still the best way to reduce the dimension of our factors.
+
+
+##### Let us now continue to dig into and view the output of our weighted k-means clustering algorithm run.
+
+
+
+
+```{r}
+factors_compare %>%
+  mutate(weight =
+           (
+             factors %>%
+               filter(PD_loss_cost_partial_credibility_UNCAPPED != 0) %>%
+               pull(PD_loss_cost_partial_credibility_UNCAPPED)
+           )) %>%
+  pivot_longer(cols = contains("factor")) %>%
+  mutate(name = gsub("pricing_factor_", "", name)) %>%
+  separate(name, into = c("coverage", "measure"), sep = "_") %>%
+  pivot_wider(names_from = measure, values_from = value) %>%
+  mutate(diff = clustered - original) %>%
+  group_by(coverage) %>%
+  summarize(
+    q_00 = quantile(diff, 0.0),
+    q_10 = quantile(diff, 0.1),
+    q_20 = quantile(diff, 0.2),
+    q_30 = quantile(diff, 0.3),
+    q_40 = quantile(diff, 0.4),
+    q_50 = quantile(diff, 0.5),
+    q_60 = quantile(diff, 0.6),
+    q_70 = quantile(diff, 0.7),
+    q_80 = quantile(diff, 0.8),
+    q_90 = quantile(diff, 0.9),
+    q_100 = quantile(diff, 1.0),
+    .groups = "drop"
+  ) %>%
+  mutate(across(.cols = colnames(.)[-1],
+                .fns = ~round(.,3))) %>%
+  t() %>%
+  as.data.frame() %>%
+  rownames_to_column() %>%
+  `colnames<-`(.[1,]) %>%
+  rename(quantile = coverage) %>%
+  `[`(-1,) %>%
+  `rownames<-`(NULL)
+```
+
+##### Here are the quantile bands of differences for each coverage as well. These show the entire distribution of changes before and after, and echo our same sentiments about the results too.
+
+
+```{r}
+factors_compare %>%
+  mutate(
+    weight = 
+      (factors %>%
+      filter(PD_loss_cost_partial_credibility_UNCAPPED != 0) %>%
+      pull(PD_loss_cost_partial_credibility_UNCAPPED))
+  ) %>%
+  pivot_longer(cols = contains("factor")) %>%
+  mutate(name = gsub("pricing_factor_", "", name)) %>%
+  separate(name, into = c("coverage", "measure"), sep = "_") %>%
+  pivot_wider(names_from = measure, values_from = value) %>%
+  mutate(diff = clustered - original) %>%
+  ggplot(aes(x = diff)) +
+  geom_histogram(bins = 300) +
+  facet_wrap(~coverage)
+```
+
+##### And here are histograms of those differences. Taller and skinnier spikes for our coverages that were given more importance further show us that the scaling worked.
+
+
+
+### Plot differences of factors before-and-after clustering
+
+```{r, cache = TRUE}
+
+dir.create("frames", showWarnings = FALSE)
+
+factors_long <-
+  factors_plot2 %>%
+  pivot_longer(cols = contains("pricing_factor"),
+               names_to = "coverage",
+               values_to = "pricing_factor")
+
+# Define color limits across all frames
+lims <- range(factors_long$pricing_factor, na.rm = TRUE)
+
+for (i in gsub("_Losses",
+               "_pricing_factor",
+               names(rev(sort(unlist( scales_ )))))
+     ) {
+
+  frame_data <- factors_long %>% filter(coverage == !!i)
+  
+  # Plot main and zoomed maps with frame-specific data
+  p_base <- ggplot(frame_data) +
+    geom_sf(aes(fill = pricing_factor), color = "black", linewidth = 0.05) +
+    scale_fill_gradient2(low = "blue", mid = "gray90", high = "red",
+                         midpoint = 0, limits = lims, na.value = "white") +
+    geom_sf(data = ca_state, fill = NA, color = "black", linewidth = 0.5) +
+    theme_void()
+
+  p_LA <-
+    p_base +
+    coord_sf(xlim = c(-119, -117.5), ylim = c(33.5, 34.25)) # +
+  
+  p_SF <-
+    p_base +
+    coord_sf(xlim = c(-122.75, -121.85), ylim = c(37.3, 38.3)) +
+    theme(legend.position = "none") +
+    ggtitle(i)
+
+  composed <-
+    p_base + theme(legend.position = "none") +
+    inset_element(p_LA, left = 0.5, bottom = 0.55, right = 1, top = 1) +
+    inset_element(p_SF, left = 0.68, bottom = 0.37, right = 1, top = .67) +
+  plot_annotation(title = paste0("change in ", i))
+  
+  rm(p_base) ; rm(p_LA) ; rm(p_SF)
+
+  ggsave(filename = glue("frames/frame_{i}.png"),
+         plot = composed, width = 9, height = 9, dpi = 150)
+}
+
+# Create animation
+img <- magick::image_read(list.files("frames", full.names = TRUE))
+animation <- magick::image_animate(img, fps = 1)
+magick::image_write(animation, "pricing_animation.gif")
+```
+
+```{r show-animation, echo=FALSE, out.width='700px'}
+knitr::include_graphics("pricing_animation.gif")
+```
+
+We see here that the changes in our coverages' factors are minimized for the coverages that had bigger scales (COLL, PD, BI). This is desirable. And we can be sure that the error we desired to minimize was done so properly because the k-means clustering does exactly that. Great!
+
+## Conclusion
+
+**For the sake of this exercise of ours' being a toy project, I will conclude here. We can dive in further, but at this point in our analysis, I would be at least convinced enough that this is the most viable solution, the results flow through sensibly, and that all assumptions for our models inputs and outputs have been dealt with properly.**
+
+
+```{r, cache = TRUE, fig.width = 16, fig.height=12, fig.align='center'}
+factors_plot %>%
+  ggplot() +
+  geom_sf(aes(fill = as.character(cluster_id)),
+          color = "black", linewidth = 0.05) +
+  geom_sf(data = ca_state, fill = NA, color = "black", linewidth = 0.5) +
+  ggtitle("All clusters")
+```
+\[\space\]
+
+Finally, you may have been worried that the clusters seem to be set at random, geographically. Just look at how there seems to be no sense or pattern about the clusters at all when you consider the geography of California. The thing is, since we're clustering 1812 ZIP codes into 150 groups, the small variation (in the grand scheme of things) and (relatively) low dimension (7 variables) give us a use case where the optimal solution is so fine tuned that it exceeds what makes sense geographically. If we had to make only 10 clusters, we would have seen much more of a trend. No wonder our error metrics were so low within each coverage.
+
+\[\space\]
+
+### *If you've made it this far, thank you so much for reading. I hope you were able to learn something, or at least pique your interest.* 
+####   *- Ryan*
+
+
+\[\space\]
+\[\space\]
+\[\space\]
+\[\space\]
+\[\space\]
+
+```{r, cache = TRUE, echo = FALSE, eval = FALSE}
+
+factors_plot <-
+  right_join(
+    x = ca_zips,
+    y = 
+      ( select(clustered_factors, -cluster_id) - original_factors ) %>%
+      mutate(Zipcode = clustered_factors$Zipcode),
+    by = c("ZCTA5" = "Zipcode")
+  )
+
+(min__ <- min(factors_plot$PD_pricing_factor))
+(max__ <- max(factors_plot$PD_pricing_factor))
+
+
+p_full <-
+  factors_plot %>%
+  ggplot() +
+  geom_sf(aes(fill = PD_pricing_factor), color = "black", linewidth = 0.05) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "gray90",
+                       midpoint = 0,
+                       limits = c(min__, max__),
+                       na.value = "white") +
+  geom_sf(data = ca_state, fill = NA, color = "black", linewidth = 0.5) +
+  theme_void() +
+  theme(legend.position = "none")
+
+# LA zoom map
+p_LA <-
+  factors_plot %>%
+  ggplot() +
+  geom_sf(aes(fill = PD_pricing_factor), color = "black", linewidth = 0.05) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "gray90",
+                       midpoint = 0,
+                       limits = c(min__, max__),
+                       na.value = "white") +
+  coord_sf(xlim = c(-119, -117.5), ylim = c(33.5, 34.25)) +
+  theme_void()
+
+p_SF <-
+  factors_plot %>%
+  ggplot() +
+  geom_sf(aes(fill = PD_pricing_factor), color = "black", linewidth = 0.05) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "gray90",
+                       midpoint = 0,
+                       limits = c(min__, max__),
+                       na.value = "white",
+                       guide = NULL) +
+  coord_sf(xlim = c(-122.75, -121.65), ylim = c(37.3, 38.3)) +
+  theme_void()
+
+library(cowplot)
+
+
+ggdraw() +
+  draw_plot(p_full) +  # Base map
+  draw_plot(p_LA, x = 0.55, y = 0.55, width = 0.5, height = 0.5) +
+  draw_plot(p_SF, x = 0.67, y = 0.15, width = 0.35, height = 0.35)
+
+
+###### lol
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,0 +1,9 @@
+*_cache/
+*_files/
+*_frames/
+*_plots/
+.RData
+.Rhistory
+.Rapp.history
+.Ruserdata
+.Rproj

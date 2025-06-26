@@ -1,0 +1,588 @@
+---
+title: "Deductible Pricing Exercise"
+author: "Ryan Voyack"
+date: "2025-06-05"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## Background:
+
+Suppose we’re Actuaries or Data Scientists working at a large insurance company. There are many components that come together to form the final model that determines the price of a policy. At a high level, this usually involves a *base rate* multiplied by various pricing *factors*, each corresponding to a specific attribute of the insured.
+
+For example, if we price a policy based only on location, each ZIP code might have its own multiplier (*factor*). We’d multiply this factor by the base rate to get the final price. The key idea is that the factor depends on something specific to the insured, while the base rate is universal (it applies to every policy).
+
+These base rates and factors are calibrated to achieve a desired average premium across the book of business. We repeat this pricing process for each coverage, since coverages tend to behave quite differently and are best priced separately. And because we price them independently, it’s convenient to standardize the pricing structure — typically by setting the average product of all factors within each pricing variable to 1 (averaged across the book of business you have or expect to have for the insurance product). If we do this, then each base rate would be close in value to the average premium we wish to charge (we do this simply because its a nice-to-have).
+
+We can accomplish this via *rebasing*. For each pricing variable, we pick a *base level* — often the most common level — and divide all other factor levels by the factor of that base level. For instance, if every ZIP code has its own factor, we might choose the most populous ZIP code as the base level and divide all ZIP code factors by that one. This sets the base ZIP code’s factor to 1 and adjusts all others accordingly. 
+
+You can think of a coverage as a distinct, mutually exclusive part of what the insurance policy protects. In business insurance, for example, “Liability” and “Property” would be separate coverages, each priced independently.
+
+Sometimes we go a step further and define a set of mutually exclusive perils that describe the specific ways a coverage can incur a loss. When we do this, we price not just by coverage, but by coverage/peril combinations. This is common in commercial insurance. A policyholder can choose which coverages they want, but once a coverage is selected, it's broken down into all applicable perils for pricing (each priced independently).
+
+Please note that there are many attributes beyond ZIP code that influence price. For a business policy, this might include industry, years in business, credit score, and more. And because policies almost always include deductibles, we also include a pricing factor for the chosen deductible amount (just like we did earlier for ZIP codes). In this exercise, we will be working with deductible pricing.
+
+
+## Motivation:
+
+In this exercise, suppose our Actuaries have created for us a table of factors for all coverage/peril combinations and offered deductible amounts, the pricing of which depends also on overall coverage limit of the policy. They've done this using [traditional ratemaking](https://www.casact.org/sites/default/files/old/studynotes_werner_modlin_ratemaking.pdf) methodologies.
+
+The actuaries instruct us that within a particular coverage/peril combination, the factors (which, again, can differ by deductible amount and coverage limit amount) must have the following properties:
+
+* 1) They must be monotonically non-increasing as deductible increases, ceteris paribus (within a particular coverage limit)
+* 2) They must be monotonically non-decreasing as coverage limit increases ceteris paribus (within a particular deductible amount)
+
+The actuaries would be able to go into the data and manually make these selections, but in order to make the process of repricing more efficient, they want an algorithm that does this for them.
+
+
+
+
+## Exercise:
+
+##### Build such a "smoothing" algorithm that works dynamically, for any possible inputs.
+
+
+\[\space\]
+
+## Step 1)  Create data that represents our indicated factors 
+
+I have been responsible with such a pricing exercise before at a prior role I held, so I understand how these factors should look. I create these to try to represent how each coverage and peril would look (since they are different), as well as how the deductible amounts and coverage limit amounts should change the factors. I add commentary after we can view these factors I create below.
+
+
+```{r, echo = TRUE, warning=FALSE, results = 'hide', message=FALSE}
+library(tidyverse)
+require(plotly)
+require(data.table)
+require(gganimate)
+require(slickR)
+options(scipen = 999)
+```
+
+#### Create the deductible factors that are tasked with smoothing
+
+```{r, cache = TRUE}
+
+### function to add a jittery-ness that we want the smoothing algorithm to fix
+sometimes_broken_sort <- function(vec, max_swaps = 3, error_rate = 0.5) {
+  sorted_vec <- sort(vec)
+  
+  num_swaps <- round(runif(1, min = 0, max = max_swaps))
+
+  dont_use_these_indices <- c(3)
+  for (i in seq_len(num_swaps)) {
+    swap_this <- sample(seq_along(sorted_vec[-dont_use_these_indices]), 1)
+    dont_use_these_indices <- c(dont_use_these_indices, swap_this)
+    
+    with_this <- swap_this
+    while(with_this != swap_this){
+      with_this <- round(rnorm(1, mean = swap_this, sd = 1.5))
+      if(with_this < 1 | with_this > length(sorted_vec))
+        with_this <- swap_this
+    }
+    temp <- sorted_vec[swap_this]
+    sorted_vec[swap_this] <- sorted_vec[with_this]
+    sorted_vec[with_this] <- temp
+  }
+  
+  return((sorted_vec))
+}
+
+### factors that give the data the shape we want
+
+peril_scales_ <-
+  data.frame(
+    peril_grouped = c("fire", "crime", "windstorm", "tornado", "water", "hail", "other"),
+    scale_ = c(.5, 1, .9, 1.2, .92, .9, 1)
+    )
+
+deductible_scales_ <-
+  data.frame(
+    deductible_amount = c(100,200,300,400,500,600,700,800,900,1000),
+    scale_ = c(1, .98, .91, .83, .81, .73, .72, .6, .54, .4)
+  )
+
+limit_scales_ <-
+  data.frame(
+    coverage_limit_size_band = c(100000, 500000, 1000000, 2500000, 5000000, 10000000, 99999999),
+    scale_ = c(1, .95, .9, .85, .81, .75, .71)^4
+  )
+
+
+### create dummy data
+
+DATA___ <-
+  list(coverage = c("home", "renters", "business", "farm", "industrial"),
+       peril_grouped = c("fire", "crime", "windstorm", "tornado", "water", "hail", "other"),
+       coverage_limit_size_band = c(100000, 500000, 1000000, 2500000, 5000000, 10000000, 99999999),
+       deductible_amount = c(100,200,300,400,500,600,700,800,900,1000)
+       )
+
+DATA___ <-
+  DATA___ %>%
+  expand.grid(KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE) %>%
+  arrange(coverage, peril_grouped, coverage_limit_size_band, deductible_amount)
+
+DATA___ <-
+  DATA___ %>%
+  group_by(coverage, peril_grouped, deductible_amount) %>%
+  ## Create factors and sort, but sometimes not perfectly
+  mutate(loss_uncovered_ratio = sometimes_broken_sort(runif(n = n(), min = .8, max = 1.2))) %>%
+  ungroup() %>%
+  ## Each deductible amount should have their own inherent price multiplier behavior
+  left_join(
+    deductible_scales_,
+    by = c("deductible_amount")
+  ) %>%
+  mutate(loss_uncovered_ratio = loss_uncovered_ratio * scale_,
+         scale_ = NULL) %>%
+  ## "REBASE" - it is common practice for insurance companies to have base levels for price multipliers
+  ##  usually they select an arbitrary rating characteristic to be the base level, setting its multiplier as 1.0
+  ##  divide all pricing factors by this amount so that curve is "centered" (we'll say) at the base level
+  pivot_wider(names_from = deductible_amount, values_from = loss_uncovered_ratio) %>%
+  mutate(across(.cols = contains("0"),
+                .fns = ~./`300`)) %>%
+  pivot_longer(cols = contains("0"),
+               names_to = "deductible_amount", values_to = "loss_uncovered_ratio") %>%
+  mutate(deductible_amount = as.numeric(deductible_amount)) %>%
+  ## As coverage limit amounts increase, the amount of loss eliminated by a deductible should decrease, and therefore the discount we apply to the price should decrease (and considering the "base level", multipliers here should be pushed toward taht base level)
+  left_join(
+    limit_scales_,
+    by = c("coverage_limit_size_band")
+  ) %>%
+  mutate(loss_uncovered_ratio = loss_uncovered_ratio ^ scale_,
+         scale_ = NULL) %>%
+  ## each peril will have their own inherent affect on pricing. We want each to slightly different means and variances since they do in practice 
+  left_join(
+    peril_scales_,
+    by = c("peril_grouped")
+  ) %>%
+  mutate(loss_uncovered_ratio = loss_uncovered_ratio ^ scale_,
+         scale_ = NULL) %>%
+  as.data.frame()
+```
+
+### View Data
+
+```{r}
+plots <-
+  lapply(X = c("home", "renters", "business", "farm", "industrial"),
+       FUN = function(x){
+         # plotly::ggplotly(
+           DATA___ %>%
+             filter(coverage == !!x) %>%
+             mutate(deductible_amount = factor(deductible_amount, levels = sort(unique(deductible_amount))),
+                    coverage_limit_size_band = factor(coverage_limit_size_band, levels = sort(unique(coverage_limit_size_band)))
+                    ) %>%
+             ggplot(aes(x = coverage_limit_size_band,
+                        y = loss_uncovered_ratio,
+                        color = deductible_amount, group = deductible_amount)) +
+             geom_line() + geom_point() + facet_wrap(~peril_grouped, nrow = 2) +
+             theme(axis.text.x = element_text(angle = 30, vjust = 1, hjust = 1, size = 6)) +
+             ggtitle(paste0('"',x,'" coverage')) + xlab("Coverage Limit group (high end)")
+          # )
+       })
+
+# Save each plot to a temporary file
+img_paths <- sapply(seq_along(plots), function(i) {
+  file <- tempfile(fileext = ".png")
+  ggsave(file, plot = plots[[i]], width = 6, height = 4, dpi = 150)
+  file
+})
+
+# Pass image paths to slickR
+slickR(img_paths)
+```
+
+
+\[\space\]
+\[\space\]
+\[\space\]
+
+Let's look at these factors. We see that generally, the lines that correspond to deductible amount factor curves are ordered by the deductible amount itself. Let's consider why that is. Firstly, these factors are meant to all be relative to one another, and every policy can only ever have 1 of these factors within each coverage/peril, based on their attributes (deductible amount chosen, coverage limit of the insured property). Recall that we price each coverage and peril combination by itself. Notice also that I've rebased all of the factors to the base level of a deductible amount of `300`, meaning all factors corresponding to a deductible amount of `300` have a factor of 1. 
+
+Let's now consider an insured who has a coverage limit of, say, \$100,000. If they pick a deductible amount of \$100, then the amount of loss eliminated by that deductible will be less than if they picked a deductible amount that was greater. Therefore, as deductible amounts increase, the price should be lower (or, at least, should never be higher). As deductible amount increases, ceteris paribus, the relativity/factor/multiplier should be monotonically non-increasing. If this was not the case, then *adverse selection* would occur!
+
+Let's also consider two insureds who both have a deductible amount of \$1,000, where one has a coverage limit of \$100,000 and the other has a coverage limit of \$1,000,000. The one with a the higher coverage limit will on average have less of their loss eliminated due to the same deductible, so they should get a higher price (or, at least, price should never decrease). Therefore, for the same deductible amount, higher coverage limits should result in relatively higher factors. As coverage limit increases, ceteris paribus, the relativity/factor/multiplier should be monotonically non-decreasing. If this was not the case, then our factors would not be *reasonable* (they would not align with how we expect the pricing to behave).
+
+This is how we get our two smoothing rules laid out in the section above!
+
+Comparing these rules to what we see in these plots, they basically boil down to:
+
+* 1) the lines in these plots should be ordered by deductible amount, and should never overlap (but they can touch)
+* 2) the lines in these plots themselves should be strictly non-decreasing (they are allowed to be flat)
+
+
+We see that the factors I've created for this example generally follow this rule, but there are some exceptions. Our goal is to have the smoothing algorithm iron those out.
+
+
+
+
+## Step 2)  Build Smoothing Algorithm
+
+Due to constraints, here's how the algorithm works:
+
+* Assume the input data is rebased to some deductible amount (add that as a parameter in the function)
+* Preliminary step: Examine the rebase level, all factors that should be below/above it that are not are assigned to the value of their "neighbor" (specifically, the adjacent deductible level that is one step closer to the base level). The idea here is that we want to deal with factors intersecting across the base level first.
+* Iterate:
+  + Identify all factor values that violate either of our two pricing rules.
+  + Of these, find the factor that has the worst error (defined by the *distance* between it and its "neighbor", implied by the following two bullets) and assign to it the value of its "neighbor"
+    - If rule 1 is violated, then its "neighbor" is the adjacent **deductible level** (to our point's deductible level) that is closer to the base level.
+    - If rule 2 is violated, then its "neighbor" is the adjacent **coverage limit amount** that is greater than current one. 
+* Stop when there are no more violations.
+  + Note: the algorithm has a maximum number of iterations it can run through, to prevent it from getting caught in a never ending loop
+
+
+Notice, from these assumptions, a few things:
+
+* Each update pushes a violating factor closer to 1 than where it started.
+  + This shrinks the overall variance in the factors, which is a good thing if we believe the violations came from unreliable data. That is, if we assume these original violations were caused by low-credibility data, then we shouldn’t trust those factor values in the first place. We're effectively deferring to more credible signals instead of clinging to noisy ones.
+* The algorithm often ends up assigning identical factor values to adjacent deductible levels or adjacent coverage limit levels.
+  + That’s a direct result of how it works: instead of smoothing or interpolating across factor values, it assigns the violating factor to its neighbor’s value. This might look crude, but there's a rationale for it. If the violation is due to a lack of credibility, then smoothing toward a different value (say, halfway between two levels) is just as arbitrary as leaving it alone. So rather than fabricate some compromise, we fully anchor the correction to a neighboring level that (ideally) comes from more credible data. That’s a more conservative and justifiable way to handle noise.
+
+
+### Define smoothing function:
+
+```{r}
+adverse_selection_and_reasonability <- function(input_, deductibles_, MAX_ITERS_MAIN_ = 100,
+                                                fixed_, line_curves_table_helper_, effective_deductible_id_,
+                                                rebase_level_,
+                                                group_var_levels) {
+  if (!is.logical(fixed_)) stop("param 'fixed_' must be true or false to coincide with if deductibles are fixed or not")
+  rlang::warn("THIS FUNCTION ASSUMES THAT YOUR FACTORS ARE REBASED TO `rebase_level_` DEDUCTIBLE LEVEL\n(when fixed_ = TRUE)",
+              .frequency_id = "smoothing_algo",
+              .frequency = "once")
+  
+  # deductible factors for deductibles below the rebase level should have factors above 1.0, and vice-versa
+  # if this isn’t the case, assign the next closest deductible level (to rebase level deductible)'s factor
+  # impose that now, such that before our algorithm runs, the lines won't cross over the 1000 level
+  # for our particular use case, this makes the smoothing better. It could run without this
+  if (fixed_) {
+    
+    ## prelim step
+    for (i in c(deductibles_[which(deductibles_ < rebase_level_)])) {
+      input_ <- input_ %>%
+        mutate(across(.cols = all_of(as.character(i)),
+                      .fns = ~ ifelse(. >= 1.0,
+                                      .,
+                                      get(colnames(cur_data())[which(colnames(cur_data()) %in% cur_column()) + 1])
+                      )))
+    }
+    
+    for (i in rev(c(deductibles_[which(deductibles_ > rebase_level_)]))) {
+      input_ <- input_ %>%
+        mutate(across(.cols = all_of(as.character(i)),
+                      .fns = ~ ifelse(. <= 1.0,
+                                      .,
+                                      get(colnames(cur_data())[which(colnames(cur_data()) %in% cur_column()) - 1])
+                      )))
+    }
+  }
+  
+  updates <- list()
+  update <- input_
+  iter <- 0
+  while(iter < MAX_ITERS_MAIN_ ){
+    iter <- iter + 1
+    reasonability <- const_1(update, deductibles_, fixed_, rebase_level_)
+    adverse_selection <- const_2(update, deductibles_, fixed_, rebase_level_)[, colnames(reasonability)]
+    
+    # ## ignore this!
+    # if (!fixed_) {
+    #   reasonability <- reasonability * line_curves_table_helper_
+    # }
+    
+    if (iter == MAX_ITERS_MAIN_) {
+      # this will reuse the code for the checks and then bring us back to the while() condition,
+      # which in this case exits the loop
+      next
+    }
+    
+    # check if any are negative (either that's the case or all sign's are just 1)
+    if (min(unique(unlist(sign(reasonability)))) == -1 ||
+        min(unique(unlist(sign(adverse_selection)))) == -1) {
+      
+      # update the assumption with more error
+      if (min(adverse_selection) < min(reasonability)) {
+        # address adverse selection
+        coords <- which(min(adverse_selection) == adverse_selection)
+        coords <- coords[1] ## address left-most adverse selection error in input_ first
+        coords <- c(ifelse(coords %% group_var_levels == 0,
+                           group_var_levels,
+                           coords %% group_var_levels), ## x
+                    ceiling(coords / group_var_levels) ## y
+                    )
+        curve <- update[coords[1], ]
+        
+        if (fixed_) {
+          # flip points that are always in the lesser (deductible) of the 2 points that create the wrongly sloped segment
+          if (coords[2] < (rev(which(deductibles_ < rebase_level_))[1] + 1)) {
+            # less than rebase_level_
+            pair <- c(coords[2], coords[2] + 1)
+          } else {
+            # greater than rebase_level_
+            pair <- c(coords[2] - 1, coords[2])
+          }
+          change_this <- pair[which(abs(curve[pair] - 1) == max(abs(curve[pair] - 1)))]
+          with_this <- pair[-which(abs(curve[pair] - 1) == max(abs(curve[pair] - 1)))]
+          
+        }else{
+          pair <- c(coords[2]-1, coords[2])
+          change_this <- pair[which(abs(curve[pair] - 1) == max(abs(curve[pair] - 1)))]
+          with_this <- pair[-which(abs(curve[pair] - 1) == max(abs(curve[pair] - 1)))]
+          
+        }
+        
+        update[coords[1],
+               change_this] <-
+          update[coords[1],
+                 with_this]
+        
+      }else{
+        # address reasonability
+          coords <- which(min(reasonability) == reasonability)
+          coords <- coords[1] ## address leftmost error
+          coords <- c(ifelse(coords %% group_var_levels == 0, group_var_levels, coords %% group_var_levels), ## x
+                      ceiling(coords / group_var_levels) ## y
+                      )
+          
+          curve <- update[,coords[2]]
+          pair <- c(coords[1] - 1, coords[1])
+          change_this <- pair[which(abs(curve[pair] - 1) == max(abs(curve[pair] - 1)))]
+          with_this <- pair[-which(abs(curve[pair] - 1) == max(abs(curve[pair] - 1)))]
+          
+          update[change_this,
+                 coords[2]] <-
+            update[with_this,
+                   coords[2]]
+      }
+    }else{
+      iter <- ifelse(iter == 1,
+                     (MAX_ITERS_MAIN_ + 2),  ## want to not trip error code
+                     (MAX_ITERS_MAIN_ - 1))  ## this means we’re all code, so just give it some number (> than what iter can possibly be)
+      
+    }
+    updates[[(length(updates)+1)]] <- update
+    updates_INTERNAL <<- updates
+    
+  }
+   
+  ## exit conditional
+  if (iter == MAX_ITERS_MAIN_ + 2) {
+    print("no need for smoothing, exiting")
+  } else if (iter == MAX_ITERS_MAIN_) {
+    # reuse code from beginning of while() loop
+    if (min(unique(unlist(sign(reasonability)))) == -1 ||
+        min(unique(unlist(sign(adverse_selection)))) == -1) {
+      stop("non-converging algorithm; giving up. Try increasing `iter` upper bound in while().")
+    } else {
+      NULL ## this means that algo converged on last possible iteration
+    }
+  }
+  
+  return(update)
+}
+```
+
+
+
+### And define helper functions:
+
+```{r}
+mode_special_ <- function(x){
+  ret <- rev(sort(table(unlist( x ))))
+  if(ret[1] == 1){
+    mean(unlist( x ))
+  }else{
+    as.numeric(names(ret[1]))
+  }
+}
+
+## "reasonability"
+const_1 <- function(a, deductibles_, fixed_, rebase_level_){
+  ### apply diffs to each column
+  # if(length(unique(sign(diff(a)))) == 1) TRUE
+  # if(all(a >= 1) | all(a <= 1)) TRUE
+  if(fixed_){
+    deductibles__ <- as.character(deductibles_[which(deductibles_ < rebase_level_)])
+  }else{
+    deductibles_ <- NULL
+  }
+  ret <-
+    a %>%
+    mutate(across(.cols = everything(),
+                  .fns = ~spec_diff_1(.))) %>%
+    mutate(across(.cols = all_of(deductibles__), .fns = ~.*-1)) %>%
+    mutate(across(.cols = all_of(deductibles__), .fns = ~c(1, .[-1])))
+  
+  if(fixed_ == TRUE && (rebase_level_ %in% deductibles_) ){
+    return( ret %>% mutate(!!sym(as.character(rebase_level_)) := 1) )
+  }else{
+    if(fixed_ == TRUE){
+      stop("no base level? I didn't code the function for this")
+    }
+    return(ret)
+  }
+}
+spec_diff_1 <- function(x){
+  ret <- c(0, diff(x))
+  # ret <- ifelse(ret == 0, 1, ret)
+  return(ret)
+}
+
+## "adverse selection"
+const_2 <- function(a, deductibles_, fixed_, rebase_level_){
+  a %>% t %>% as.data.frame %>% mutate(across(.cols = everything(), .fns = ~spec_diff_2(., deductibles_, fixed_, rebase_level_))) %>% t %>% as.data.frame
+}
+spec_diff_2 <- function(x, deductibles_, fixed_, rebase_level_){
+  if(fixed_){
+    deductibles__ <- which(deductibles_ < rebase_level_)
+  }else{
+    deductibles__ <- NULL
+  }
+  ret <- diff(x)
+  if(fixed_){
+    ret <- c(ret[deductibles__], -1, ret[-deductibles__])
+  }else{
+    ret <- c(-1, ret)
+  }
+  ## now that we treat this vector as diffs, which we take min from, assign this 1.0 (or, what will be -1 below)
+  ret <- ifelse(ret == 0, -1, ret)
+  ret <- ret * -1
+  return(ret)
+}
+```
+
+
+Now we have our functions written, it's time to apply them. We do this for each coverage / peril combination.
+
+## Step 3)  Apply smoothing to our pricing multipliers (factors)
+
+```{r, cache = TRUE, warnings = FALSE}
+inputs <-
+  DATA___ %>%
+  mutate(deductible_amount = factor(deductible_amount, levels = sort(unique(as.numeric(deductible_amount)))))
+
+updates <- list()
+for(cov in unique(DATA___$coverage)){
+  levels <- sort(unique(DATA___$coverage_limit_size_band))
+
+  perils_ <- inputs %>% filter(coverage == !!cov) %>% pull(peril_grouped) %>% unique()
+  for(peril in perils_){
+    # print(paste(cov, peril))
+    input <-
+      inputs %>%
+      filter(coverage == !!cov) %>%
+      filter(peril_grouped == !!peril) %>%
+      select(coverage_limit_size_band, loss_uncovered_ratio, deductible_amount) %>%
+      arrange(coverage_limit_size_band) %>%
+      transmute(x = coverage_limit_size_band, y = loss_uncovered_ratio, z = deductible_amount) %>%
+      arrange(z) %>%
+      pivot_wider(names_from = z, values_from = y) %>%
+      as.data.frame() %>%
+      `rownames<-`(.$x) %>%
+      mutate(x = NULL)
+    
+    updates_INTERNAL <- list() ## for error handling when algo breaks or hits MAX_ITERS_MAIN_
+    
+    updates[[paste0(cov, "__", peril)]] <-
+      adverse_selection_and_reasonability( input,
+                                           deductibles_ = c(100,200,300,400,500,600,700,800,900,1000),
+                                           MAX_ITERS_MAIN_ = 100,
+                                           fixed_ = TRUE,
+                                           group_var_levels = length(levels),
+                                           rebase_level_ = 300
+                                           ) %>%
+      mutate(coverage_limit_size_band = !!levels)
+  }
+} ; print("Done! :)")
+```
+
+
+### View how the smoothing algorithm works, step by step!
+
+I set the function up to use the scoping operator `<<-` to save to this `updates_INTERNAL` object so that you can look what was happening when the function breaks if it in encounters and error. The scoping operator constantly overwrites this object every time the function is called, so what we have stored in this object at this time is the data sent to the algorithm in the final iteration of our loop above, corresponding to:
+
+```{r, echo = FALSE}
+print(paste(cov, ",", peril))
+```
+
+```{r}
+for(i in 1:length(updates_INTERNAL)){
+  updates_INTERNAL[[i]] <-
+    updates_INTERNAL[[i]] %>%
+    rownames_to_column(var = "coverage_limit_size_band") %>%
+    pivot_longer(cols = contains("0"),
+                 names_to = "deductible_amount", values_to = "loss_uncovered_ratio") %>%
+    mutate(coverage_limit_size_band = factor(coverage_limit_size_band, levels = unique(sort(as.numeric(coverage_limit_size_band)))))
+}
+
+updates_INTERNAL <-
+  updates_INTERNAL %>%
+  data.table::rbindlist(use.names = TRUE, fill = FALSE, idcol = "frames_")
+
+frames_ <- unique(updates_INTERNAL$frames_)
+
+p <-
+  updates_INTERNAL %>%
+  mutate(deductible_amount = factor(deductible_amount, levels = sort(as.numeric(unique(deductible_amount))))) %>%
+  ggplot(aes(x = coverage_limit_size_band,
+             y = loss_uncovered_ratio,
+             color = deductible_amount, group = deductible_amount
+             )) + geom_line(lwd = .8) + geom_point() +
+  labs(title = paste(cov, ",", peril, "  -  Iteration: {frame}")) +
+   transition_manual(frames = frames_)
+
+animate(p, nframes = length(frames_), fps = 1, renderer = gifski_renderer())
+```
+
+
+
+
+## Visualize factors before and after using our Smoothing Algorithm
+
+```{r}
+plots <-
+  lapply(X = c("home", "renters", "business", "farm", "industrial"),
+       FUN = function(x){
+         list(
+           Original = inputs,
+           Smoothed = updates %>%
+             data.table::rbindlist(idcol = "cov_peril") %>%
+             separate(col = cov_peril, sep = "__", into = c("coverage", "peril_grouped")) %>%
+             pivot_longer(cols = contains("0"),
+                          names_to = "deductible_amount", values_to = "loss_uncovered_ratio") %>%
+             mutate(coverage_limit_size_band = as.character(coverage_limit_size_band))
+         ) %>%
+           data.table::rbindlist(use.names = TRUE, fill = FALSE, idcol = "model") %>%
+           filter(coverage == !!x) %>%
+           ggplot(aes(x = factor(coverage_limit_size_band, levels = sort(unique(as.numeric(coverage_limit_size_band)))),
+                      y = loss_uncovered_ratio,
+                      color = deductible_amount, group = deductible_amount)) +
+           geom_line(lwd = .8) + facet_grid(model~peril_grouped) + xlab("coverage_limit_size_band") +
+           theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 6)) +
+           ggtitle(paste0("coverage: ", x))
+       })
+
+# Save each plot to a temporary file
+img_paths <- sapply(seq_along(plots), function(i) {
+  file <- tempfile(fileext = ".png")
+  ggsave(file, plot = plots[[i]], width = 6, height = 4, dpi = 150)
+  file
+})
+
+# Pass image paths to slickR
+slickR(img_paths)
+```
+
+
+
+
+
+
+
+
+
